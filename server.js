@@ -49,8 +49,13 @@ const refreshCookieOptions = {
 };
 
 // --- STORE REFRESH TOKEN (in-memory; production thật nên dùng Redis/DB) ---
-// Map: refreshToken -> userId. Chỉ token do server phát hành mới được chấp nhận.
+// Map: token -> { userId, expiresAt, replacedBy?, graceUntil? }
+// Chỉ token do server phát hành mới được chấp nhận; có TTL để không sống vĩnh viễn.
 const refreshTokenStore = new Map();
+const REFRESH_TOKEN_TTL = 7 * 24 * 60 * 60 * 1000; // 7 ngày
+// Token vừa bị xoay vẫn được chấp nhận thêm 1 khoảng ngắn -> chống việc nhiều request
+// refresh song song (vd nhiều API cùng dính 401) đá nhau ra ngoài.
+const ROTATION_GRACE_MS = 10 * 1000;
 
 // Sinh refresh token ngẫu nhiên, khó đoán (thay cho timestamp dễ trùng/đoán)
 const generateRefreshToken = () =>
@@ -59,9 +64,24 @@ const generateRefreshToken = () =>
 // Phát hành + lưu refresh token mới cho user, trả về token
 const issueRefreshToken = (userId) => {
   const token = generateRefreshToken();
-  refreshTokenStore.set(token, userId);
+  refreshTokenStore.set(token, {
+    userId,
+    expiresAt: Date.now() + REFRESH_TOKEN_TTL,
+  });
   return token;
 };
+
+// Dọn token đã hết hạn / đã xoay quá grace window -> tránh Map phình vô hạn
+const sweepRefreshTokens = () => {
+  const now = Date.now();
+  for (const [token, rec] of refreshTokenStore) {
+    if (now > rec.expiresAt || (rec.replacedBy && now > rec.graceUntil)) {
+      refreshTokenStore.delete(token);
+    }
+  }
+};
+// Quét định kỳ; unref() để interval không giữ tiến trình sống
+setInterval(sweepRefreshTokens, 10 * 60 * 1000).unref();
 
 // --- LOG MỌI REQUEST ĐẾN ---
 app.use((req, res, next) => {
@@ -223,19 +243,34 @@ app.post("/api/auth/refresh", (req, res) => {
   if (!refreshToken)
     return res.status(403).json({ message: "Không có refresh token!" });
 
-  // Chỉ chấp nhận token do server phát hành (chống token giả mạo)
-  const userId = refreshTokenStore.get(refreshToken);
-  if (!userId) {
-    // Token không hợp lệ -> dọn cookie rác phía client luôn
+  const now = Date.now();
+  const rec = refreshTokenStore.get(refreshToken);
+
+  // Không tồn tại (giả mạo) hoặc đã hết hạn -> từ chối + dọn cookie rác phía client
+  if (!rec || now > rec.expiresAt) {
+    if (rec) refreshTokenStore.delete(refreshToken);
     res.clearCookie(REFRESH_COOKIE_NAME, refreshCookieOptions);
     return res.status(403).json({ message: "Refresh token không hợp lệ!" });
   }
 
-  // Rotation: thu hồi token cũ, phát hành token mới (chống replay)
-  refreshTokenStore.delete(refreshToken);
-  const newRefreshToken = issueRefreshToken(userId);
+  let newRefreshToken;
+  if (rec.replacedBy) {
+    // Token đã được xoay trước đó. Còn trong grace window -> trả lại đúng token mới
+    // (idempotent) để nhiều request refresh song song không đá nhau ra ngoài.
+    if (now > rec.graceUntil) {
+      refreshTokenStore.delete(refreshToken);
+      res.clearCookie(REFRESH_COOKIE_NAME, refreshCookieOptions);
+      return res.status(403).json({ message: "Refresh token không hợp lệ!" });
+    }
+    newRefreshToken = rec.replacedBy;
+  } else {
+    // Rotation: phát hành token mới, đánh dấu token cũ đã xoay (giữ tạm trong grace window)
+    newRefreshToken = issueRefreshToken(rec.userId);
+    rec.replacedBy = newRefreshToken;
+    rec.graceUntil = now + ROTATION_GRACE_MS;
+  }
 
-  const expireAt = Date.now() + TOKEN_EXPIRE_TIME;
+  const expireAt = now + TOKEN_EXPIRE_TIME;
   res.cookie(REFRESH_COOKIE_NAME, newRefreshToken, refreshCookieOptions);
 
   res.json({
@@ -247,7 +282,12 @@ app.post("/api/auth/refresh", (req, res) => {
 // 2b. Logout - Thu hồi refresh token + xóa cookie (HttpOnly nên chỉ server xóa được)
 app.post("/api/auth/logout", (req, res) => {
   const refreshToken = req.cookies[REFRESH_COOKIE_NAME];
-  if (refreshToken) refreshTokenStore.delete(refreshToken); // thu hồi khỏi store
+  if (refreshToken) {
+    const rec = refreshTokenStore.get(refreshToken);
+    // Thu hồi cả token đã xoay (nếu có) để logout dứt điểm cả chuỗi rotation
+    if (rec && rec.replacedBy) refreshTokenStore.delete(rec.replacedBy);
+    refreshTokenStore.delete(refreshToken);
+  }
   // clearCookie phải khớp path/sameSite/secure như lúc set -> dùng lại refreshCookieOptions
   res.clearCookie(REFRESH_COOKIE_NAME, refreshCookieOptions);
   res.json({ message: "Đã đăng xuất" });
