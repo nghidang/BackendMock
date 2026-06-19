@@ -1,13 +1,12 @@
 {
   "info": {
     "name": "BackendMock API",
-    "description": "Mock backend API server (Node.js + Express) with token expiration. Login auto-saves the access token & refresh token to collection variables.",
+    "description": "Mock backend API server (Node.js + Express) with token expiration. Login auto-saves the access token. Refresh token được set vào HttpOnly cookie (Postman tự lưu/gửi qua cookie jar).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     { "key": "baseUrl", "value": "http://localhost:3000", "type": "string" },
-    { "key": "token", "value": "", "type": "string" },
-    { "key": "refreshToken", "value": "", "type": "string" }
+    { "key": "token", "value": "", "type": "string" }
   ],
   "item": [
     {
@@ -37,7 +36,6 @@
               "if (pm.response.code === 200) {",
               "    const json = pm.response.json();",
               "    if (json.token) pm.collectionVariables.set('token', json.token);",
-              "    if (json.refreshToken) pm.collectionVariables.set('refreshToken', json.refreshToken);",
               "    console.log('Token saved:', json.token);",
               "}"
             ]
@@ -49,19 +47,13 @@
       "name": "2. Refresh Token",
       "request": {
         "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
-        },
+        "header": [],
         "url": {
-          "raw": "{{baseUrl}}/api/refresh-token",
+          "raw": "{{baseUrl}}/api/auth/refresh",
           "host": ["{{baseUrl}}"],
-          "path": ["api", "refresh-token"]
+          "path": ["api", "auth", "refresh"]
         },
-        "description": "Cấp access token mới từ refresh token."
+        "description": "Cấp access token mới. Refresh token đọc từ HttpOnly cookie (Postman tự gửi qua cookie jar) — không cần body."
       },
       "event": [
         {
@@ -72,7 +64,6 @@
               "if (pm.response.code === 200) {",
               "    const json = pm.response.json();",
               "    if (json.token) pm.collectionVariables.set('token', json.token);",
-              "    if (json.refreshToken) pm.collectionVariables.set('refreshToken', json.refreshToken);",
               "}"
             ]
           }
@@ -80,7 +71,20 @@
       ]
     },
     {
-      "name": "3. Get Products",
+      "name": "3. Logout",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/auth/logout",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "auth", "logout"]
+        },
+        "description": "Thu hồi refresh token ở server + xóa cookie. Postman tự gửi cookie qua cookie jar."
+      }
+    },
+    {
+      "name": "4. Get Products",
       "request": {
         "method": "GET",
         "header": [
@@ -99,7 +103,7 @@
       }
     },
     {
-      "name": "4. Create Product",
+      "name": "5. Create Product",
       "request": {
         "method": "POST",
         "header": [
@@ -119,7 +123,7 @@
       }
     },
     {
-      "name": "5. Dashboard",
+      "name": "6. Dashboard",
       "request": {
         "method": "GET",
         "header": [

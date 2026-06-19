@@ -31,27 +31,41 @@ Server chạy tại: `http://localhost:3000`
 
 ## API Endpoints
 
-| Method | Endpoint              | Auth | Mô tả                                      |
-|--------|-----------------------|------|--------------------------------------------|
-| POST   | `/api/login`          | ❌   | Đăng nhập, trả về `token` + `refreshToken` |
-| POST   | `/api/refresh-token`  | ❌   | Cấp access token mới                       |
-| GET    | `/api/products`       | ✅   | Danh sách sản phẩm (lọc `name`, `category`)|
-| POST   | `/api/products`       | ✅   | Tạo sản phẩm mới                           |
-| GET    | `/api/dashboard`      | ✅   | Thống kê dashboard (10 fields)             |
+| Method | Endpoint            | Auth   | Mô tả                                                        |
+|--------|---------------------|--------|--------------------------------------------------------------|
+| POST   | `/api/login`        | Public | Đăng nhập, trả về `token`; refresh token vào HttpOnly cookie |
+| POST   | `/api/auth/refresh` | Cookie | Đọc refresh token từ cookie, cấp access token mới (rotate)   |
+| POST   | `/api/auth/logout`  | Cookie | Thu hồi refresh token + xóa cookie                           |
+| GET    | `/api/products`     | Bearer | Danh sách sản phẩm (lọc `name`, `category`)                  |
+| POST   | `/api/products`     | Bearer | Tạo sản phẩm mới                                             |
+| GET    | `/api/dashboard`    | Bearer | Thống kê dashboard (10 fields)                               |
 
-Các API có `✅` yêu cầu header:
+- **Bearer**: yêu cầu header `Authorization: Bearer <access_token>`.
+- **Cookie**: dựa vào **HttpOnly cookie** `refreshToken` (path `/api/auth`) — client gọi với
+  `withCredentials: true` (axios) hoặc `credentials: "include"` (fetch). Refresh token
+  **không** còn nằm trong response body.
 
-```
-Authorization: Bearer <access_token>
-```
+> Cookie tự điều chỉnh theo môi trường: production (`NODE_ENV=production`) dùng
+> `Secure; SameSite=None`; dev dùng `SameSite=Lax` (chạy được trên `http://localhost`).
+> Origin cho credentialed request đọc từ env `CORS_ORIGINS` (phẩy phân tách),
+> mặc định `http://localhost:5173,http://localhost:3000`.
 
 ## Ví dụ
 
 ```bash
-# Login
+# Login - lưu cookie (refresh token) vào cookies.txt
 curl -X POST http://localhost:3000/api/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"123456"}'
+  -d '{"username":"admin","password":"123456"}' \
+  -c cookies.txt
+
+# Refresh - gửi cookie lên, KHÔNG cần body
+curl -X POST http://localhost:3000/api/auth/refresh \
+  -b cookies.txt -c cookies.txt
+
+# Logout - thu hồi refresh token + xóa cookie
+curl -X POST http://localhost:3000/api/auth/logout \
+  -b cookies.txt
 
 # Gọi API cần token
 curl http://localhost:3000/api/products \
