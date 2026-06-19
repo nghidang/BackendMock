@@ -1,18 +1,25 @@
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
+const crypto = require("crypto");
 const app = express();
 const PORT = 3000;
 
 // --- CORS: chỉ luồng auth mới cần credentialed (gửi/nhận cookie) ---
-// Các origin được phép cho credentialed request (KHÔNG được dùng "*" khi có credentials)
-const AUTH_ORIGINS = ["http://localhost:5173", "http://localhost:3000"];
+// Các origin được phép cho credentialed request (KHÔNG được dùng "*" khi có credentials).
+// Đọc từ env CORS_ORIGINS (phân tách bằng dấu phẩy), fallback về localhost cho dev.
+const AUTH_ORIGINS = (
+  process.env.CORS_ORIGINS || "http://localhost:5173,http://localhost:3000"
+)
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
 // Các path auth cần cookie HttpOnly -> CORS specific-origin + credentials
 const AUTH_PATHS = [
   "/api/login",
   "/api/register",
-  "/api/refresh-token",
-  "/api/logout",
+  "/api/auth/refresh",
+  "/api/auth/logout",
 ];
 
 const credentialedCors = cors({ origin: AUTH_ORIGINS, credentials: true });
@@ -36,7 +43,24 @@ const refreshCookieOptions = {
   httpOnly: true, // JS phía client không đọc được -> chống XSS
   secure: IS_PROD, // chỉ bật Secure (yêu cầu HTTPS) ở production
   sameSite: IS_PROD ? "none" : "lax", // none cần Secure; dev dùng lax cho http localhost
-  path: "/api/refresh-token", // chỉ gửi cookie tới đúng endpoint refresh (least privilege)
+  // Cookie chỉ gửi tới các route auth (refresh + logout), không lọt sang /api/products...
+  // (least privilege) nhưng vẫn đủ rộng để logout đọc được mà thu hồi token.
+  path: "/api/auth",
+};
+
+// --- STORE REFRESH TOKEN (in-memory; production thật nên dùng Redis/DB) ---
+// Map: refreshToken -> userId. Chỉ token do server phát hành mới được chấp nhận.
+const refreshTokenStore = new Map();
+
+// Sinh refresh token ngẫu nhiên, khó đoán (thay cho timestamp dễ trùng/đoán)
+const generateRefreshToken = () =>
+  `refresh_${crypto.randomBytes(32).toString("hex")}`;
+
+// Phát hành + lưu refresh token mới cho user, trả về token
+const issueRefreshToken = (userId) => {
+  const token = generateRefreshToken();
+  refreshTokenStore.set(token, userId);
+  return token;
 };
 
 // --- LOG MỌI REQUEST ĐẾN ---
@@ -137,24 +161,20 @@ const authenticate = (req, res, next) => {
   if (!authHeader)
     return res.status(401).json({ message: "Không tìm thấy token!" });
 
-  const token = authHeader.split(" ")[1]; // Bearer <token>
-
-  console.log("Received Token:", token);
-
-  try {
-    // Token có dạng: access_token_TIMESTAMP
-    const tokenParts = token.split("_");
-    const expireAt = parseInt(tokenParts[2]);
-
-    console.log("Token expireAt:", expireAt, "Current Time:", Date.now());
-
-    if (Date.now() > expireAt) {
-      return res.status(401).json({ message: "Token đã hết hạn!" });
-    }
-    next();
-  } catch (error) {
+  const [scheme, token] = authHeader.split(" "); // "Bearer <token>"
+  if (scheme !== "Bearer" || !token)
     return res.status(401).json({ message: "Token không hợp lệ!" });
-  }
+
+  // Token có dạng: access_token_<expireAt>
+  const match = /^access_token_(\d+)$/.exec(token);
+  if (!match)
+    return res.status(401).json({ message: "Token không hợp lệ!" });
+
+  const expireAt = Number(match[1]);
+  if (Date.now() > expireAt)
+    return res.status(401).json({ message: "Token đã hết hạn!" });
+
+  next();
 };
 
 // --- API ROUTES ---
@@ -170,7 +190,7 @@ app.post("/api/login", (req, res) => {
     // console.log(`  ✅ Login thành công: username="${username}"`);
     const expireAt = Date.now() + TOKEN_EXPIRE_TIME;
     const accessToken = `access_token_${expireAt}`;
-    const refreshToken = `refresh_token_${Date.now()}`;
+    const refreshToken = issueRefreshToken(user.id);
 
     // Tách password ra, chỉ lấy phần còn lại
     const { password: _, ...safeUser } = user;
@@ -197,20 +217,26 @@ app.post("/api/login", (req, res) => {
   }
 });
 
-// 2. Refresh Token - Đọc refresh token từ HttpOnly cookie, cấp token mới
-app.post("/api/refresh-token", (req, res) => {
+// 2. Refresh Token - Xác thực token trong store, xoay vòng rồi cấp token mới
+app.post("/api/auth/refresh", (req, res) => {
   const refreshToken = req.cookies[REFRESH_COOKIE_NAME];
   if (!refreshToken)
     return res.status(403).json({ message: "Không có refresh token!" });
 
-  const expireAt = Date.now() + TOKEN_EXPIRE_TIME;
+  // Chỉ chấp nhận token do server phát hành (chống token giả mạo)
+  const userId = refreshTokenStore.get(refreshToken);
+  if (!userId) {
+    // Token không hợp lệ -> dọn cookie rác phía client luôn
+    res.clearCookie(REFRESH_COOKIE_NAME, refreshCookieOptions);
+    return res.status(403).json({ message: "Refresh token không hợp lệ!" });
+  }
 
-  // Xoay vòng refresh token mới rồi set lại cookie
-  res.cookie(
-    REFRESH_COOKIE_NAME,
-    `refresh_token_${Date.now()}`,
-    refreshCookieOptions,
-  );
+  // Rotation: thu hồi token cũ, phát hành token mới (chống replay)
+  refreshTokenStore.delete(refreshToken);
+  const newRefreshToken = issueRefreshToken(userId);
+
+  const expireAt = Date.now() + TOKEN_EXPIRE_TIME;
+  res.cookie(REFRESH_COOKIE_NAME, newRefreshToken, refreshCookieOptions);
 
   res.json({
     token: `access_token_${expireAt}`,
@@ -218,8 +244,10 @@ app.post("/api/refresh-token", (req, res) => {
   });
 });
 
-// 2b. Logout - Xóa refresh token cookie (HttpOnly nên chỉ server xóa được)
-app.post("/api/logout", (req, res) => {
+// 2b. Logout - Thu hồi refresh token + xóa cookie (HttpOnly nên chỉ server xóa được)
+app.post("/api/auth/logout", (req, res) => {
+  const refreshToken = req.cookies[REFRESH_COOKIE_NAME];
+  if (refreshToken) refreshTokenStore.delete(refreshToken); // thu hồi khỏi store
   // clearCookie phải khớp path/sameSite/secure như lúc set -> dùng lại refreshCookieOptions
   res.clearCookie(REFRESH_COOKIE_NAME, refreshCookieOptions);
   res.json({ message: "Đã đăng xuất" });
