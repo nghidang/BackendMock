@@ -1,10 +1,59 @@
 const express = require("express");
 const cors = require("cors");
+const cookieParser = require("cookie-parser");
 const app = express();
 const PORT = 3000;
 
-app.use(cors());
+// --- CORS: chỉ luồng auth mới cần credentialed (gửi/nhận cookie) ---
+// Các origin được phép cho credentialed request (KHÔNG được dùng "*" khi có credentials)
+const AUTH_ORIGINS = ["http://localhost:5173", "http://localhost:3000"];
+// Các path auth cần cookie HttpOnly -> CORS specific-origin + credentials
+const AUTH_PATHS = [
+  "/api/login",
+  "/api/register",
+  "/api/refresh-token",
+  "/api/logout",
+];
+
+const credentialedCors = cors({ origin: AUTH_ORIGINS, credentials: true });
+const publicCors = cors({ origin: "*" }); // request thường dùng Bearer header, không cần cookie
+
+// Chọn cấu hình CORS theo path (chạy cho cả preflight OPTIONS lẫn request thật)
+app.use((req, res, next) => {
+  if (AUTH_PATHS.includes(req.path)) return credentialedCors(req, res, next);
+  return publicCors(req, res, next);
+});
+
 app.use(express.json());
+app.use(cookieParser());
+
+// --- CẤU HÌNH COOKIE CHO REFRESH TOKEN ---
+const REFRESH_COOKIE_NAME = "refreshToken";
+const IS_PROD = process.env.NODE_ENV === "production";
+// Prod: Secure + SameSite=None (cross-site, bắt buộc HTTPS).
+// Dev (http://localhost): hạ cấp xuống secure:false + SameSite=Lax để browser chịu lưu cookie.
+const refreshCookieOptions = {
+  httpOnly: true, // JS phía client không đọc được -> chống XSS
+  secure: IS_PROD, // chỉ bật Secure (yêu cầu HTTPS) ở production
+  sameSite: IS_PROD ? "none" : "lax", // none cần Secure; dev dùng lax cho http localhost
+  path: "/api/refresh-token", // chỉ gửi cookie tới đúng endpoint refresh (least privilege)
+};
+
+// --- LOG MỌI REQUEST ĐẾN ---
+app.use((req, res, next) => {
+  const time = new Date().toISOString();
+  console.log(`\n[${time}] ${req.method} ${req.originalUrl}`);
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log("  Body:", JSON.stringify(req.body));
+  }
+
+  // Log status code khi response trả về
+  res.on("finish", () => {
+    console.log(`  -> ${res.statusCode} ${res.statusMessage}`);
+  });
+
+  next();
+});
 
 // --- CẤU HÌNH THỜI GIAN HẾT HẠN ---
 const TOKEN_EXPIRE_TIME = 60 * 1000; // 60 giây
@@ -118,6 +167,7 @@ app.post("/api/login", (req, res) => {
   );
 
   if (user) {
+    // console.log(`  ✅ Login thành công: username="${username}"`);
     const expireAt = Date.now() + TOKEN_EXPIRE_TIME;
     const accessToken = `access_token_${expireAt}`;
     const refreshToken = `refresh_token_${Date.now()}`;
@@ -125,30 +175,54 @@ app.post("/api/login", (req, res) => {
     // Tách password ra, chỉ lấy phần còn lại
     const { password: _, ...safeUser } = user;
 
+    // Set refreshToken vào HttpOnly cookie (không trả về trong body nữa)
+    res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions);
+
     res.json({
       user: safeUser,
       token: accessToken,
-      refreshToken,
       expireAt, // client biết khi nào hết hạn để chủ động refresh
     });
   } else {
+    // Giúp debug: cho biết sai username hay sai password
+    // const userByName = USERS.find((u) => u.username === username);
+    // if (!userByName) {
+    //   console.log(`  ❌ Login fail: username="${username}" không tồn tại`);
+    // } else {
+    //   console.log(
+    //     `  ❌ Login fail: sai password cho username="${username}" (nhận được="${password}")`,
+    //   );
+    // }
     res.status(401).json({ message: "Tài khoản hoặc mật khẩu không đúng!" });
   }
 });
 
-// 2. Refresh Token - Cấp token mới với timestamp hết hạn mới
+// 2. Refresh Token - Đọc refresh token từ HttpOnly cookie, cấp token mới
 app.post("/api/refresh-token", (req, res) => {
-  const { refreshToken } = req.body;
+  const refreshToken = req.cookies[REFRESH_COOKIE_NAME];
   if (!refreshToken)
     return res.status(403).json({ message: "Không có refresh token!" });
 
   const expireAt = Date.now() + TOKEN_EXPIRE_TIME;
 
+  // Xoay vòng refresh token mới rồi set lại cookie
+  res.cookie(
+    REFRESH_COOKIE_NAME,
+    `refresh_token_${Date.now()}`,
+    refreshCookieOptions,
+  );
+
   res.json({
     token: `access_token_${expireAt}`,
-    refreshToken: `refresh_token_${Date.now()}`,
     expireAt, // client biết khi nào hết hạn để chủ động refresh
   });
+});
+
+// 2b. Logout - Xóa refresh token cookie (HttpOnly nên chỉ server xóa được)
+app.post("/api/logout", (req, res) => {
+  // clearCookie phải khớp path/sameSite/secure như lúc set -> dùng lại refreshCookieOptions
+  res.clearCookie(REFRESH_COOKIE_NAME, refreshCookieOptions);
+  res.json({ message: "Đã đăng xuất" });
 });
 
 // --- CÁC API DƯỚI ĐÂY PHẢI CÓ TOKEN MỚI CALL ĐƯỢC ---
